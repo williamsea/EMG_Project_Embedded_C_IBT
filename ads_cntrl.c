@@ -18,14 +18,16 @@
 /********************/
 
 /*Changeable Variables*/
+static volatile int txEnvelop = 1; // 1 to transmit envelop signal, 0 to transmit raw signal
 static volatile int WindowLength = 100;//50,100,200,300,400,500;
 static volatile int window[100];//[100];//window and WindowLength
-static volatile int envelop=0;
-static volatile int spikeCutoffVal = 20000; //for gain 6 //5000; for gain 1 //Set signal under threshold to peak
-static volatile int signalPeak = 5000; //2k to 5k for gain = 6 //800; for gain = 1 //1400;//Used for EMG signal normalization to 0-255
+static volatile int spikeCutoffVal = 20000; //for gain 6 //5000; for gain 1 //Set raw signal under threshold to peak
+static volatile int rawSignalPeak = 20000;
+static volatile int envelopPeak = 5000; //2k to 5k for gain = 6 //800; for gain = 1 //1400;//Used for EMG signal normalization to 0-255
 static volatile int baselineThresh = 256;//get rid of the EMG baseline noises in envelop
 
 /* Variables For Envelop Filter */
+static volatile int envelop=0;
 static volatile int DACenvelop = 0;
 static volatile int DigitizedEnvelop = 0;
 static volatile int digitizeLevel = 100;//77;
@@ -346,12 +348,11 @@ void __ISR(_TIMER_1_IRQ, IPL3) Timer1Handler(void){
     if(result > spikeCutoffVal){ //Typical abnormal spike is in the order of 8*10^6 to 8*10^4. Can be as small as 5k when gain = 1. The peak raw sigal is 3k-4k for gain = 1.
         //So set the threshold as 5k for gain = 1.
         //The peak signal in gain 12 is about 4*10^4
-        result = signalPeak; //cut the spike
+        result = rawSignalPeak; //cut the spike
     }
     if(result < -spikeCutoffVal){
-        result = -signalPeak;
+        result = -rawSignalPeak;
     }
-
 
     //////////////////////////////////////////
     // Convert Raw Data to Envelop          //
@@ -394,7 +395,7 @@ void __ISR(_TIMER_1_IRQ, IPL3) Timer1Handler(void){
     //     Which corresponding to 0-3.3V    //
     //          By Hai Tang, 2015.8.10      //
     //////////////////////////////////////////
-    DACenvelop = envelop*255/(signalPeak-baselineThresh);//D2 envelop peaks at 1400 with gain 1. Normalize DACenvelop to 0-255
+    DACenvelop = envelop*255/(envelopPeak-baselineThresh);//D2 envelop peaks at 1400 with gain 1. Normalize DACenvelop to 0-255
     if(DACenvelop>255){
         DACenvelop = 255;//For DACenvelop>255, make it 255, otherwise it will become DACenvelop-255 as default
     }
@@ -405,22 +406,23 @@ void __ISR(_TIMER_1_IRQ, IPL3) Timer1Handler(void){
     //   Digitize the envelop to 77 levels  //
     //          By Hai Tang, 2015.8.13      //
     //////////////////////////////////////////
-    DigitizedEnvelop = floor(DACenvelop/stepSize);
+//    DigitizedEnvelop = floor(DACenvelop/stepSize);
 
     //////////////////////////////////////////
     // Transmit data though UART interface  //
     //////////////////////////////////////////
     static volatile int tx_data;
     utx(35);
-
-//    //Transimit the raw data
-//    tx_data = result>>16;
-//    utx(tx_data);
-//    tx_data = result>>8;
-//    utx(tx_data);
-//    tx_data = result;
-//    utx(tx_data);
-
+    if(txEnvelop == 0){
+    //Transimit the raw data
+    tx_data = result>>16;
+    utx(tx_data);
+    tx_data = result>>8;
+    utx(tx_data);
+    tx_data = result;
+    utx(tx_data);
+    }
+    else if (txEnvelop == 1){
     //Transmit the envelop
     tx_data = envelop>>16;//shift right, only the most significant byte left
     utx(tx_data);
@@ -428,7 +430,7 @@ void __ISR(_TIMER_1_IRQ, IPL3) Timer1Handler(void){
     utx(tx_data);
     tx_data = envelop;
     utx(tx_data);
-
+    }
     utx(36);
 
     //////////////////////////
