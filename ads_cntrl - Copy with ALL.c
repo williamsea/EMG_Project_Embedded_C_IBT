@@ -17,28 +17,31 @@
 /* Global Variables */
 /********************/
 
-/*Changeable Variables*/
-static volatile int WindowLength = 100;//50,100,200,300,400,500;
-static volatile int window[100];//[100];//window and WindowLength
-static volatile int envelop=0;
-static volatile int spikeCutoffVal = 20000; //for gain 6 //5000; for gain 1 //Set signal under threshold to peak
-static volatile int signalPeak = 5000; //2k to 5k for gain = 6 //800; for gain = 1 //1400;//Used for EMG signal normalization to 0-255
-static volatile int baselineThresh = 256;//get rid of the EMG baseline noises in envelop
-
-/* Variables For Envelop Filter */
-static volatile int DACenvelop = 0;
-static volatile int DigitizedEnvelop = 0;
-static volatile int digitizeLevel = 100;//77;
-static volatile double stepSize = 2.56;//for 256/100  //3.32467532; for 256/77, for digitizing the DACenvelop signal (0-255)
-static volatile int id = 0;
-static volatile int i=0;
-static volatile int resultPrev = 0;
-static volatile int integral = 0;
-
 /* Variables used to get data from ADS chip */
 static volatile unsigned char temp;
 static volatile int emg_data=0;
 static volatile int result=0;
+/* Variables For Envelop Filter */
+static volatile int envelop=0;
+static volatile int DACenvelop = 0;
+static volatile int DigitizedEnvelop = 0;
+static volatile int WindowLength = 400;//100;
+static volatile int window[400];//[100];//window and WindowLength
+static volatile int noiseCutoffVal = 600;//Set signal under threshold to 0
+static volatile int spikeCutoffVal = 20000; //gain 6 //5000;//gain 1 //Set signal under threshold to peak
+static volatile int signalPeak = 2000; // gain = 6 //800; //gain = 1 //1400;//Used for EMG signal normalization to 0-255
+static volatile int jumpThresh = 250;//get rid of the EMG signal jump due to noise cutoff in raw
+static volatile int digitizeLevel = 100;//77;
+static volatile double stepSize = 2.56;//256/100  //3.32467532; // 256/77, for digitizing the DACenvelop signal (0-255)
+static volatile int id = 0;
+static volatile int i=0;
+static volatile int zeroID = 0;
+static volatile int numZeros = 0;//number of zeros in the moving window
+static volatile double numZeroCriteria = 0.9;//calculate the envelop only when the number of zeros in a window is less than numZeroCriteria*WindowLength; i.e., signal > 10%
+//static volatile double MMAprev = 0; //For Modified Moving Average, previous value
+//static volatile double MMAcurr = 0; //Current value
+static volatile int resultPrev = 0;
+static volatile int integral = 0;
 
 ///* Variables for I2C2 interrupt */
 //unsigned char CommandCount=0;
@@ -76,6 +79,39 @@ void utx(unsigned char data){
     U2TXREG=data;
 }
 
+int HighPass_filter_IIR(int new_data,int prev_data, int prev_output){
+    /********************************************************************/
+    /* First order butterworth filter                                   */
+    /* implements the equations:                                        */
+    /* y[i] = b_0*x[i] + b_1*x[i-1] - a_1*y[i-1]                        */
+    /* Filter coefficients obtained with the following lines in MATLAB  */
+    /* Fc = 10;                                                         */
+    /* Fs = 3e3;                                                        */
+    /* N = 32;                                                          */
+    /* [bhat,ahat] = butter(1,Fc/(Fs/2),'high');                        */
+    /* b = round(bhat*2^(N-1));                                         */
+    /* a = round(ahat*2^(N-1));                                         */
+    /* Since b_0 = -1*b_1 we only store a single coefficient below      */
+    /* Note: coefficients derived when using 3kHz sampling, with 1 kHz  */
+    /* sampling rate Fc becomes 10/3, which is still acceptable         */
+    /* for baseline drift removal                                       */
+    /********************************************************************/
+    
+    int b = 2125227504;
+    int a = -2102971360;
+    int delta;
+    long long in_prod;
+    long long out_prod;
+    long long yM;
+    int y;
+    delta = new_data-prev_data;
+    in_prod = (long long) b*delta;
+    out_prod = (long long) a*prev_output;
+    yM = in_prod - out_prod;
+    y = yM >> 31;
+    return(y);
+}
+
 int HighPass_filter_IIR_Hai(int new_data,int prev_data, int prev_output){
     /********************************************************************/
     /* First order butterworth filter                                   */
@@ -94,13 +130,13 @@ int HighPass_filter_IIR_Hai(int new_data,int prev_data, int prev_output){
     /* for baseline drift removal                                       */
     /********************************************************************/
 
-//    //Fc=10
-//    int b = 2125227504;
-//    int a = -2102971360;
+    //Fc=10
+    int b = 2125227504;
+    int a = -2102971360;
 
-    //Fc=30, cutoff = 10Hz
-    int b =  2082052512;
-    int a = -2016621376;
+//    //Fc=30
+//    int b =  2082052512;
+//    int a = -2016621376;
 
 //    //Fc=50
 //    int b =  2040543305;
@@ -129,6 +165,12 @@ int HighPass_filter_IIR_Hai(int new_data,int prev_data, int prev_output){
     yM = in_prod - out_prod;
     y = yM >> 31;
     return(y);
+}
+
+int HPF_10Poles_Hai(int new_data){
+    static volatile int b[10];
+    static volatile int a[10];
+
 }
 
 int Notch_filter_IIR(int new_data){
@@ -317,7 +359,8 @@ void __ISR(_TIMER_1_IRQ, IPL3) Timer1Handler(void){
     //       By Hai Tang, 2015.9.11             //
     //////////////////////////////////////////////
     result = result - integral;
-    integral = integral + (resultPrev + ((result - resultPrev)>>1))>>3; //Do not use *.125 etc, since it will force result's data type changed from int to float. Use >> instead.
+//    integral = integral + 0.125 * (resultPrev + 0.5 * (result - resultPrev)); //Not working, unstable
+    integral = integral + (resultPrev + ((result - resultPrev)>>1))>>3; //Works
     resultPrev = result;
 
     // Check for overflow, if so saturate result:
@@ -339,37 +382,100 @@ void __ISR(_TIMER_1_IRQ, IPL3) Timer1Handler(void){
     else if(result<MIN_ADS_OUT)
         result=MIN_ADS_OUT;
 
+
+
     /////////////////////////////////////////////////
     //      Cut off Abnormal Large Spike on Raw    //
     //          By Hai Tang, 2015.9.2              //
     /////////////////////////////////////////////////
-    if(result > spikeCutoffVal){ //Typical abnormal spike is in the order of 8*10^6 to 8*10^4. Can be as small as 5k when gain = 1. The peak raw sigal is 3k-4k for gain = 1.
-        //So set the threshold as 5k for gain = 1.
-        //The peak signal in gain 12 is about 4*10^4
-        result = signalPeak; //cut the spike
-    }
-    if(result < -spikeCutoffVal){
-        result = -signalPeak;
-    }
+//    if(result > spikeCutoffVal){ //Typical abnormal spike is in the order of 8*10^6 to 8*10^4. Can be as small as 5k when gain = 1. The peak raw sigal is 3k-4k for gain = 1.
+//        //So set the threshold as 5k for gain = 1.
+//        //The peak signal in gain 12 is about 4*10^4
+//        result = signalPeak; //cut the spike
+//    }
+//    if(result < -spikeCutoffVal){
+//        result = -signalPeak;
+//    }
+
+
+    //////////////////////////////////////////
+    //     Modified Moving Average On Raw   //
+    //     Reduce DC/Low Frequency Signal   //
+    //     By Hai Tang, 2015.9.1            //
+    //////////////////////////////////////////
+//    MMAcurr = (127*MMAprev + result)/128;
+//    result = result - MMAcurr;
+//    MMAprev = MMAcurr;
+
+
 
 
     //////////////////////////////////////////
     // Convert Raw Data to Envelop          //
     // By Hai Tang, 2015.7.22               //
     //////////////////////////////////////////
+    
+//    result = abs(result);//rectify the result data (flip negative part to positive); Not needed for RMS
+
+        //////////////////////////////////////////
+        //       Cut off Noises in Raw          //
+        //          By Hai Tang, 2015.7.24      //
+        //////////////////////////////////////////
+//    if(result<noiseCutoffVal){ //600 is the chosen number for D2 when gain is set to 1
+//        result=0;
+//    }
+
+
+    /////////////////////   Method 1:Moving Average /////////////////////
+//    if(id<WindowLength){//Fill the window
+//        window[id] = result;
+//        id++;
+//    }
+//    else if(id>=WindowLength){
+//        envelop = 0;//clear previous envelop value
+//        //Take the average of window
+//        for(i=0; i<WindowLength; i++){
+//            envelop += window[i]/WindowLength;
+//        }
+//        //Shift the window forward 1 step
+//        for(i=0; i<WindowLength-1; i++){
+//            window[i] = window[i+1];
+//        }
+//        window[WindowLength-1] = result;
+//    }
+    //////////////////////////////////////////////////////////////////////
+
+    /////////////////////   Method 2: Two Coefficients  //////////////////
+    //////////////////   Cannot cut 250 jump on envelope /////////////////
+//    envelop = 0.99*envelop+0.01*result;                                 //
+    //////////////////////////////////////////////////////////////////////
 
     /////////////////////   Method 3: RMS (Root Mean Square) /////////////////////
+    /////////////////////        Including Zero Criteria     /////////////////////
     if(id<WindowLength){//Fill the window
         window[id] = result;
         id++;
     }
-    else if(id>=WindowLength){
+    else if(id>=WindowLength){//Count the number of 0s in the current window
+//        numZeros = 0;
+//        for(zeroID=0; zeroID<WindowLength;zeroID++){
+//            if(window[zeroID]==0){
+//                numZeros++;
+//            }
+//        }
+
         envelop = 0;//clear previous envelop value
-        //Take the RMS window
-        for(i=0; i<WindowLength; i++){
-            envelop += window[i]*window[i]/WindowLength;// square, mean, put mean here to avoid data overflow
-        }
-        envelop = sqrt(envelop);// root
+        //Also for if(numZeros>WindowLength*numZeroCriteria)
+        //Which means if the window is filled majorly by 0s, then the calculated envelop value from this window is set to 0.
+
+//        if(numZeros<WindowLength*numZeroCriteria){//calculate the envelop only when the number of zeros in a window is less than numZeroCriteria*WindowLength
+            //In other words, number of signal > WindowLength*(1-numZeroCriteria) in a window makes a counted envelop point
+            //Take the RMS window
+            for(i=0; i<WindowLength; i++){
+                envelop += window[i]*window[i]/WindowLength;// square, mean, put mean here to avoid data overflow
+            }
+            envelop = sqrt(envelop);// root
+//        }
 
        //Shift the window forward 1 step
         for(i=0; i<WindowLength-1; i++){
@@ -380,26 +486,55 @@ void __ISR(_TIMER_1_IRQ, IPL3) Timer1Handler(void){
     }
     //////////////////////////////////////////////////////////////////////
 
-    ////////////////////////////////////////////////////
-    //   Shift Down and Cut Negative Part of Envelop  //
-    //            By Hai Tang, 2015.9.2           //
-    ////////////////////////////////////////////////////
-    envelop -= baselineThresh;
-    if(envelop<0){
-        envelop=0;
-    }
+    //////////////////////////////////////////
+    //        Modified Moving               //
+    //     Reduce DC/Low Frequency signal   //
+    //     By Hai Tang, 2015.9.1            //
+    //////////////////////////////////////////
+//    MMAcurr = (1023*MMAprev + envelop)/1024;
+//    envelop = envelop - MMAcurr;
+//    if(envelop<0){
+//        envelop=0;
+//    }
+//    MMAprev = MMAcurr;
+
+
+    //////////////////////////////////////////
+    //Cut off Noises upon Envelop(Not in Use)//
+    //          By Hai Tang, 2015.7.24      //
+    //////////////////////////////////////////
+//    if(envelop<255){
+//        envelop=0;
+//    }
+
+
+    //////////////////////////////////////////
+    //      Get rid of Envelop jump         //
+    //       By Hai Tang, 2015.8.11         //
+    //////////////////////////////////////////
+//    if(envelop>jumpThresh){
+//        envelop = envelop-jumpThresh; //Cut off the 250 jump
+//    }
+//    else{
+//        envelop = 0; //For the original envelop < 250, just set to 0, since there are few of them.
+//                     //Otherwise it will remain and cause a spike. Eg, 251 becomes 1, while 249 (or 23) was preserved as a spike.
+//    }
     
+
     //////////////////////////////////////////
     //     Rescale the envelop to 0-255     //
     //     Which corresponding to 0-3.3V    //
     //          By Hai Tang, 2015.8.10      //
     //////////////////////////////////////////
-    DACenvelop = envelop*255/(signalPeak-baselineThresh);//D2 envelop peaks at 1400 with gain 1. Normalize DACenvelop to 0-255
+    DACenvelop = envelop*255/signalPeak;//D2 envelop peaks at 1400 with gain 1. Normalize DACenvelop to 0-255
+//    DACenvelop = envelop*255/1200;
     if(DACenvelop>255){
         DACenvelop = 255;//For DACenvelop>255, make it 255, otherwise it will become DACenvelop-255 as default
     }
     unsigned char DAC_WRITE_BUF_on[8] = {DACenvelop,DACenvelop,0,0,0,0,0,0};
     DAC_Output(0b00000011, DAC_WRITE_BUF_on);
+//    unsigned char DAC_WRITE_BUF_on[8] = {50,100,150,200,250,255,0,10};
+//    DAC_Output(0b11111111, DAC_WRITE_BUF_on);
 
     //////////////////////////////////////////
     //   Digitize the envelop to 77 levels  //
@@ -407,27 +542,85 @@ void __ISR(_TIMER_1_IRQ, IPL3) Timer1Handler(void){
     //////////////////////////////////////////
     DigitizedEnvelop = floor(DACenvelop/stepSize);
 
+
+    ////////////////////////////////////////////////////
+    //   Shift Down and Cut Negative Part of Envelop  //
+    //            By Hai Tang, 2015.9.2           //
+    ////////////////////////////////////////////////////
+    envelop -= 256;//200;
+    if(envelop<0){
+        envelop=0;
+    }
+
     //////////////////////////////////////////
     // Transmit data though UART interface  //
     //////////////////////////////////////////
     static volatile int tx_data;
     utx(35);
 
+    
+    //Transimit the emg data before any filtering
+//    tx_data = emg_data>>16;
+//    utx(tx_data);
+//    tx_data = emg_data>>8;
+//    utx(tx_data);
+//    tx_data = emg_data;
+//    utx(tx_data);
+
 //    //Transimit the raw data
-//    tx_data = result>>16;
+    tx_data = result>>16;
+    utx(tx_data);
+    tx_data = result>>8;
+    utx(tx_data);
+    tx_data = result;
+    utx(tx_data);
+
+//    //Transimit the integral data
+//    tx_data = integral>>16;
 //    utx(tx_data);
-//    tx_data = result>>8;
+//    tx_data = integral>>8;
 //    utx(tx_data);
-//    tx_data = result;
+//    tx_data = integral;
 //    utx(tx_data);
 
     //Transmit the envelop
-    tx_data = envelop>>16;//shift right, only the most significant byte left
-    utx(tx_data);
-    tx_data = envelop>>8;
-    utx(tx_data);
-    tx_data = envelop;
-    utx(tx_data);
+//    tx_data = envelop>>16;//shift right, only the most significant byte left
+//    utx(tx_data);
+//    tx_data = envelop>>8;
+//    utx(tx_data);
+//    tx_data = envelop;
+//    utx(tx_data);
+
+//    //Transmit the MMA
+//    tx_data = MMAcurr>>16;//shift right, only the most significant byte left
+//    utx(tx_data);
+//    tx_data = MMAcurr>>8;
+//    utx(tx_data);
+//    tx_data = MMAcurr;
+//    utx(tx_data);
+
+    //Transmit the digitized envelop
+//    tx_data = DigitizedEnvelop>>16;//shift right, only the most significant byte left
+//    utx(tx_data);
+//    tx_data = DigitizedEnvelop>>8;
+//    utx(tx_data);
+//    tx_data = DigitizedEnvelop;
+//    utx(tx_data);
+
+//    tx_data = -1>>16;//Debug
+//    utx(tx_data);
+//    tx_data = -1>>8;
+//    utx(tx_data);
+//    tx_data = -1;
+//    utx(tx_data);
+
+
+//    tx_data = numZeros>>16;//shift right, only the most significant byte left
+//    utx(tx_data);
+//    tx_data = numZeros>>8;
+//    utx(tx_data);
+//    tx_data = numZeros;
+//    utx(tx_data);
 
     utx(36);
 
@@ -436,6 +629,8 @@ void __ISR(_TIMER_1_IRQ, IPL3) Timer1Handler(void){
     //////////////////////////
     IFS0CLR = 0x00000010;
 }
+
+
 
 int main(void) {
     SYSTEMConfigPerformance(80000000L);// ALU performance optimized for the given clock frequency
@@ -446,6 +641,8 @@ int main(void) {
     init_ads1291();
     init_timer1_intRC();
     INTCONbits.MVEC=1; // interrupt vector to multi-vector mode
+//    INTEnableSystemMultiVectoredInt();
+
 
     //////////////////////////////////
     // Initialize I2C2 and Ports    //
@@ -456,15 +653,21 @@ int main(void) {
      DDPCONbits.TROEN=0;
      DDPCONbits.TDOEN=0;
      initPORTs();
+    // delay(30000);
      INTEnableSystemMultiVectoredInt();  //enable the multivectored interrupt<<<<required for interrupt enabling>>>
-     initI2C2();
+    // initDAC();
+    initI2C2();
 
+    
     while(TRUE){
         // wait here to be interrupted by timer1 
         // would be better / more power efficient to sleep here
     }
     return 0;
 }
+
+
+
 
 //Added by Hai Tang, 2015.8.10
 void initI2C2(void)
@@ -479,7 +682,7 @@ void initI2C2(void)
                 //Or 98, calculated by Megan with tor=0
 
  //I2C2BRG=22;  //22 =400kHz 18MHz clock
- //I2C2BRG=88;  //88 =400kHz 72MHz clock
+//I2C2BRG=88;  //88 =400kHz 72MHz clock
  //I2C2BRG=72;  //72 =100kHz 14.7456MHz clock
  //I2C1BRGCLR=0xFFFFFFFF;
  //I2C1BRGSET=35;  //35 =100kHz 7.3728MHz clock
@@ -492,7 +695,61 @@ void initI2C2(void)
  IPC8bits.I2C2IS=3;  //sub-priority
 
  I2C2CONSET=0x00008000;
+//	I2C2CONbits.ON = 1;
 }
+
+
+////Added by Hai Tang, 2015.8.11
+//void __ISR(33, ipl7) I2C2SlaveInterrupt(void)
+//{
+//	 unsigned char Temp=0;
+//
+//	if(I2C2STATbits.I2COV)
+//		{
+//			Temp = I2C2RCV;
+//			while(I2C2STATbits.RBF);
+//			I2C2STATbits.I2COV = 0;
+//		}
+//
+//	if((I2C2STATbits.R_W == 0)&&(I2C2STATbits.D_A == 0))	//Address matched
+//		{
+//			Temp = I2C2RCV;		//dummy ready
+//	     	while(I2C2STATbits.RBF);  //wait until received
+//            CommandCount=0;
+//		}
+//
+//	else if((I2C2STATbits.R_W == 0)&&(I2C2STATbits.D_A == 1))	//check for data
+//		{
+//			int I2C2event_code;
+//			Temp = I2C2RCV;										//dummy read //release SCL lin
+//			I2C2CONSET = 0x1000;								//release SCL line
+//	     	while(I2C2STATbits.RBF);							//wait until received
+//            I2C2event_code=Temp;
+//		}
+//
+//	else if((I2C2STATbits.R_W == 1)&&(I2C2STATbits.D_A == 0))
+//		{
+//			Temp = I2C2RCV;
+//        	CommandCount==0;
+//        	I2C2TRN=CmdBuf_temp[CommandCount];
+//        	CommandCount++;
+//			I2C2CONSET = 0x1000;								//release SCL line
+//			while(I2C2STATbits.TBF);							//wait until transmitted
+//    	}
+//
+//    else
+//    {
+//		Temp = I2C2RCV;
+//        I2C2TRN=CmdBuf_temp[CommandCount];
+//		I2C2CONSET = 0x1000;									//release SCL line
+//		while(I2C2STATbits.TBF);								//wait until transmitted
+//        CommandCount++;
+//    }
+//
+// IFS1bits.I2C2SIF=0;
+// IFS1bits.I2C2MIF=0;
+//}
+
 
 //Added by Hai Tang, 2015.8.11
 //***************port initilization***********************//
