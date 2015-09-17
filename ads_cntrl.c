@@ -348,7 +348,7 @@ void __ISR(_TIMER_1_IRQ, IPL3) Timer1Handler(void){
     if(result > spikeCutoffVal){ //Typical abnormal spike is in the order of 8*10^6 to 8*10^4. Can be as small as 5k when gain = 1. The peak raw sigal is 3k-4k for gain = 1.
         //So set the threshold as 5k for gain = 1.
         //The peak signal in gain 12 is about 4*10^4
-        result = rawSignalPeak; //cut the spike
+        result = rawSignalPeak; //cutoff the spike
     }
     if(result < -spikeCutoffVal){
         result = -rawSignalPeak;
@@ -383,7 +383,7 @@ void __ISR(_TIMER_1_IRQ, IPL3) Timer1Handler(void){
 
     ////////////////////////////////////////////////////
     //   Shift Down and Cut Negative Part of Envelop  //
-    //            By Hai Tang, 2015.9.2           //
+    //            By Hai Tang, 2015.9.2               //
     ////////////////////////////////////////////////////
     envelop -= baselineThresh;
     if(envelop<0){
@@ -414,22 +414,22 @@ void __ISR(_TIMER_1_IRQ, IPL3) Timer1Handler(void){
     static volatile int tx_data;
     utx(35);
     if(txEnvelop == 0){
-    //Transimit the raw data
-    tx_data = result>>16;
-    utx(tx_data);
-    tx_data = result>>8;
-    utx(tx_data);
-    tx_data = result;
-    utx(tx_data);
+        //Transimit the raw data
+        tx_data = result>>16;
+        utx(tx_data);
+        tx_data = result>>8;
+        utx(tx_data);
+        tx_data = result;
+        utx(tx_data);
     }
     else if (txEnvelop == 1){
-    //Transmit the envelop
-    tx_data = envelop>>16;//shift right, only the most significant byte left
-    utx(tx_data);
-    tx_data = envelop>>8;
-    utx(tx_data);
-    tx_data = envelop;
-    utx(tx_data);
+        //Transmit the envelop
+        tx_data = envelop>>16;//shift right, only the most significant byte left
+        utx(tx_data);
+        tx_data = envelop>>8;
+        utx(tx_data);
+        tx_data = envelop;
+        utx(tx_data);
     }
     utx(36);
 
